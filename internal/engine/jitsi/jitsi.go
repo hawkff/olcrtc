@@ -379,7 +379,15 @@ func (s *Session) waitForJingle() {
 			logger.Warnf("jitsi: jingle setup failed: %v", err)
 			s.requestReconnect("jingle setup failed")
 		}
+		return
 	}
+
+	// Connect returns before Jingle/ICE/DTLS setup completes, while the client
+	// immediately starts its bounded peer wait. Announce as soon as the bridge
+	// receive loop is armed instead of waiting for the independently-phased
+	// periodic keepalive. The peer-routing server acknowledges this request
+	// with a frame targeted to our local epoch.
+	s.announceEpoch()
 }
 
 // completeJingleSetup opens the bridge and negotiates a PeerConnection only
@@ -787,15 +795,23 @@ func randomTrackSuffix() string {
 	return base64.RawURLEncoding.EncodeToString(b[:])
 }
 
-// updates its endpoint lastActivity timestamp. Without this, JVB expires the
-// endpoint after its inactivity timeout (~30-60s) when the ICE/DTLS path is
-// routed through a TURN relay whose allocation silently dies.
+// announceEpoch queues a zero-payload bridge frame that advertises the local
+// epoch. Peer-routing receivers answer it with a targeted acknowledgement.
+func (s *Session) announceEpoch() {
+	if err := s.Send(nil); err != nil {
+		logger.Debugf("jitsi: epoch announce failed: %v", err)
+	}
+}
+
+// bridgeKeepalive periodically advertises the local epoch and updates the JVB
+// endpoint's lastActivity timestamp. Without this, JVB expires the endpoint
+// after its inactivity timeout (~30-60s) when the ICE/DTLS path is routed
+// through a TURN relay whose allocation silently dies.
 //
 // The frame is a normal olcrtc bridge frame with an empty payload: the
-// recipient's acceptEpochFrame returns 0 bytes, deliverBridgeMessage drops
-// it before invoking onData, and the wire is exactly len(magic)+8 bytes
-// (well under JVB's 16 KiB max-message-size). This works for both transports
-// JVB exposes:
+// recipient's epoch decoder returns 0 bytes, so delivery drops it before a
+// data callback, and the wire is exactly len(magic)+8 bytes (well under JVB's
+// 16 KiB max-message-size). This works for both transports JVB exposes:
 //
 //   - colibri-ws: BridgeSendRaw serialises through Bridge().SendRaw.
 //   - SCTP:       BridgeSendRaw writes onto the data channel directly.
@@ -1243,7 +1259,14 @@ func (s *Session) deliverBridgeMessage(msg j.BridgeMessage, ok bool) bool {
 	if !valid {
 		return true
 	}
-	if s.onPeerData != nil && msg.From != "" {
+	if s.onPeerData != nil {
+		if msg.From == "" {
+			// Peer routing requires the bridge-authored endpoint identity for
+			// safe reverse delivery. JVB normally stamps it; fail closed rather
+			// than collapsing an anonymous frame into the singleton data path.
+			logger.Debugf("jitsi: drop peer frame without sender identity")
+			return true
+		}
 		return s.deliverPeerBridgePayload(msg.From, payload)
 	}
 	data, ok := s.acceptEpochFrame(payload)
@@ -1273,7 +1296,19 @@ func bridgePayload(msg j.BridgeMessage) ([]byte, bool) {
 
 func (s *Session) deliverPeerBridgePayload(from string, payload []byte) bool {
 	data, ok := s.acceptPeerEpochFrame(from, payload)
-	if !ok || len(data) == 0 {
+	if !ok {
+		return true
+	}
+	if len(data) == 0 {
+		// An empty frame is an epoch request. The peer map was updated by
+		// acceptPeerEpochFrame, so SendTo encodes this peer's epoch as the
+		// receiver and JVB routes the acknowledgement to the same endpoint.
+		// Re-acknowledging duplicate requests is intentional: it makes a lost
+		// acknowledgement recoverable without creating a loop (clients do not
+		// acknowledge frames on the singleton receive path).
+		if err := s.SendTo(from, nil); err != nil {
+			logger.Debugf("jitsi: peer epoch acknowledgement failed: %v", err)
+		}
 		return true
 	}
 	s.onPeerData(from, data)
@@ -1322,30 +1357,16 @@ func (s *Session) acceptEpochFrame(payload []byte) ([]byte, bool) {
 			receiverEpoch, s.localEpoch.Load())
 		return nil, false
 	}
-	// Untargeted (broadcast) frame handling. A broadcast carries
-	// receiverEpoch==0 because the sender does not yet know our localEpoch.
-	//
-	// We MUST accept a broadcast while we are still unlatched (peerEpoch==0):
-	// the client blocks in WaitForPeer until peerEpoch latches, and that latch
-	// can only come from the peer's first frame. On both initial connect and
-	// after a reconnect (which resets peerEpoch to 0 and re-announces via a
-	// broadcast Send(nil)), that first frame is a broadcast - the sender has
-	// not learned our epoch yet. Dropping it here wedges WaitForPeer for its
-	// whole timeout and the link never comes up ("ping works, no connection").
-	//
-	// Once we ARE latched (peerEpoch!=0) we only accept broadcasts from that
-	// same latched sender; a broadcast from a different senderEpoch is a
-	// third-party olcrtc instance or a stale ghost in a polluted room and is
-	// dropped. A genuine peer reconnect arrives as a fresh-epoch broadcast
-	// only after peerEpoch was reset to 0, so it bootstraps via the unlatched
-	// branch above.
+	// A targeted client must become ready only from the server's epoch
+	// acknowledgement. The client announces its local epoch as a broadcast;
+	// the peer-routing server records the bridge-authored sender identity and
+	// replies with receiverEpoch==localEpoch. Accepting an arbitrary first
+	// broadcast here lets another client in the same room satisfy WaitForPeer
+	// and cross-wire the following smux handshake.
 	if s.requireTargetedPeer && s.onPeerData == nil && receiverEpoch != s.localEpoch.Load() {
-		knownPeerEpoch := s.peerEpoch.Load()
-		if knownPeerEpoch != 0 && senderEpoch != knownPeerEpoch {
-			logger.Debugf("jitsi: drop untargeted bridge frame senderEpoch=0x%08x localEpoch=0x%08x",
-				senderEpoch, s.localEpoch.Load())
-			return nil, false
-		}
+		logger.Debugf("jitsi: drop untargeted bridge frame senderEpoch=0x%08x localEpoch=0x%08x",
+			senderEpoch, s.localEpoch.Load())
+		return nil, false
 	}
 	// Update the peer-epoch latch and ALWAYS accept the frame.
 	//
@@ -1898,7 +1919,15 @@ func (s *Session) resetPeerEpochs() {
 // frame (confirming their bridge is open), or ctx is cancelled.
 // Implements engine.PeerReadySession.
 func (s *Session) WaitForPeer(ctx context.Context) error {
-	const pollInterval = 50 * time.Millisecond
+	const (
+		pollInterval     = 50 * time.Millisecond
+		announceInterval = 500 * time.Millisecond
+	)
+	pollTicker := time.NewTicker(pollInterval)
+	defer pollTicker.Stop()
+	announceTicker := time.NewTicker(announceInterval)
+	defer announceTicker.Stop()
+
 	for {
 		if s.peerEpoch.Load() != 0 {
 			return nil
@@ -1906,7 +1935,11 @@ func (s *Session) WaitForPeer(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("wait for peer: %w", ctx.Err())
-		case <-time.After(pollInterval):
+		case <-announceTicker.C:
+			if s.bridgeReady.Load() {
+				s.announceEpoch()
+			}
+		case <-pollTicker.C:
 		}
 	}
 }

@@ -284,14 +284,19 @@ func TestDeliverBridgeMessageWithPeerDataDoesNotLatchSinglePeer(t *testing.T) {
 	js.onPeerData = func(peerID string, b []byte) {
 		got[peerID] = string(b)
 	}
+	js.onData = func([]byte) {
+		t.Fatal("peer-routed frame fell back to singleton delivery")
+	}
 
 	frameA := makeBridgeFrameForEpoch(t, 0x1111, 0, []byte("alpha"))
 	frameB := makeBridgeFrameForEpoch(t, 0x2222, 0, []byte("beta"))
+	anonymous := makeBridgeFrameForEpoch(t, 0x3333, 0, []byte("anonymous"))
 	js.deliverBridgeMessage(makeBridgeMessageFrom("peerA", map[string]any{rawFieldKey: frameA}), true)
 	js.deliverBridgeMessage(makeBridgeMessageFrom("peerB", map[string]any{rawFieldKey: frameB}), true)
+	js.deliverBridgeMessage(makeBridgeMessageFrom("", map[string]any{rawFieldKey: anonymous}), true)
 
-	if got["peerA"] != "alpha" || got["peerB"] != "beta" {
-		t.Fatalf("peer data = %#v, want both peers delivered", got)
+	if got["peerA"] != "alpha" || got["peerB"] != "beta" || got[""] != "" {
+		t.Fatalf("peer data = %#v, want named peers only", got)
 	}
 }
 
@@ -343,20 +348,14 @@ func TestReconnectEpochAnnounceWithZeroPeerEpochIsAccepted(t *testing.T) {
 	}
 }
 
-// TestRequireTargetedPeerLatchesFirstBroadcastThenRejectsOthers codifies the
-// field-verified handshake order under WaitForPeer. The client blocks in
-// WaitForPeer until peerEpoch latches, and the latch can only come from the
-// peer's first bridge frame. Because the client waits before sending its own
-// SYN, the server has not learned the client's localEpoch yet, so that first
-// frame necessarily arrives as a broadcast (receiverEpoch==0). The guard must
-// therefore accept an unlatched broadcast (or WaitForPeer wedges and the link
-// never comes up - "ping works, no connection"). Once latched, broadcasts from
-// a different senderEpoch (a third-party olcrtc instance or a stale ghost in a
-// polluted room) are dropped, while further frames from the latched peer keep
-// flowing.
+// TestRequireTargetedPeerWaitsForTargetedAcknowledgement verifies that a
+// room-wide broadcast cannot satisfy client readiness. The client first
+// announces its epoch; the peer-routing server replies with receiverEpoch set
+// to that client epoch. Only this targeted acknowledgement may latch the server
+// before the smux handshake starts.
 //
-//nolint:cyclop // setup asserts latch, epoch, and delivery state
-func TestRequireTargetedPeerLatchesFirstBroadcastThenRejectsOthers(t *testing.T) {
+//nolint:cyclop // protocol regression test asserts every latch and delivery transition
+func TestRequireTargetedPeerWaitsForTargetedAcknowledgement(t *testing.T) {
 	var received [][]byte
 	sess, err := New(context.Background(), engine.Config{
 		URL:                 testHost,
@@ -377,37 +376,172 @@ func TestRequireTargetedPeerLatchesFirstBroadcastThenRejectsOthers(t *testing.T)
 	}
 	js.localEpoch.Store(0x3333)
 
-	// Server welcome arrives as a broadcast (receiverEpoch==0) because the
-	// server has not learned our epoch yet. It must latch us and be delivered
-	// so WaitForPeer can unblock.
-	serverWelcome := makeBridgeFrameForEpoch(t, 0x1111, 0, []byte("SERVER_WELCOME"))
-	js.deliverBridgeMessage(makeBridgeMessageFrom("server", map[string]any{rawFieldKey: serverWelcome}), true)
+	broadcast := makeBridgeFrameForEpoch(t, 0x1111, 0, []byte("SERVER_BROADCAST"))
+	js.deliverBridgeMessage(makeBridgeMessageFrom("server", map[string]any{rawFieldKey: broadcast}), true)
+	if len(received) != 0 || js.peerEpoch.Load() != 0 || js.peerEndpoint.Load() != nil {
+		t.Fatalf("untargeted frame changed client state: received=%q epoch=0x%08x endpoint=%v",
+			received, js.peerEpoch.Load(), js.peerEndpoint.Load())
+	}
+
+	targeted := makeBridgeFrameForEpoch(t, 0x1111, 0x3333, []byte("SERVER_WELCOME"))
+	js.deliverBridgeMessage(makeBridgeMessageFrom("server", map[string]any{rawFieldKey: targeted}), true)
 	if len(received) != 1 || string(received[0]) != "SERVER_WELCOME" {
-		t.Fatalf("received = %q, want server welcome", received)
+		t.Fatalf("received = %q, want targeted server welcome", received)
 	}
 	if got := js.peerEpoch.Load(); got != 0x1111 {
-		t.Fatalf("peerEpoch after welcome = 0x%08x, want server epoch", got)
+		t.Fatalf("peerEpoch after acknowledgement = 0x%08x, want server epoch", got)
 	}
 	if got := js.peerEndpoint.Load(); got == nil || *got != "server" {
-		t.Fatalf("peerEndpoint after welcome = %v, want server", got)
+		t.Fatalf("peerEndpoint after acknowledgement = %v, want server", got)
 	}
 
-	// A broadcast from a different senderEpoch after we are latched is a
-	// third-party/ghost and must be dropped.
-	otherClient := makeBridgeFrameForEpoch(t, 0x2222, 0, []byte("CLIENT_HELLO"))
+	otherClient := makeBridgeFrameForEpoch(t, 0x2222, 0, []byte("OTHER_CLIENT"))
 	js.deliverBridgeMessage(makeBridgeMessageFrom("clientB", map[string]any{rawFieldKey: otherClient}), true)
-	if len(received) != 1 {
-		t.Fatalf("received after third-party broadcast = %q, want only server welcome", received)
+	if len(received) != 1 || js.peerEpoch.Load() != 0x1111 {
+		t.Fatalf("third-party broadcast changed client state: received=%q epoch=0x%08x",
+			received, js.peerEpoch.Load())
 	}
-	if got := js.peerEpoch.Load(); got != 0x1111 {
-		t.Fatalf("peerEpoch after third-party broadcast = 0x%08x, want latched server epoch", got)
+}
+
+//nolint:cyclop // request/ack regression test validates both endpoints and every frame field
+func TestInitialEpochRequestAckUnblocksTargetedPeer(t *testing.T) {
+	clientData := false
+	clientSession, err := New(context.Background(), engine.Config{
+		URL:                 testHost,
+		Extra:               map[string]string{credentialKeyRoom: testRoom},
+		RequireTargetedPeer: true,
+		OnData:              func([]byte) { clientData = true },
+	})
+	if err != nil {
+		t.Fatalf("New(client): %v", err)
+	}
+	defer func() { _ = clientSession.Close() }()
+
+	serverData := false
+	serverSession, err := New(context.Background(), engine.Config{
+		URL:        testHost,
+		Extra:      map[string]string{credentialKeyRoom: testRoom},
+		OnPeerData: func(string, []byte) { serverData = true },
+	})
+	if err != nil {
+		t.Fatalf("New(server): %v", err)
+	}
+	defer func() { _ = serverSession.Close() }()
+
+	client, ok := clientSession.(*Session)
+	if !ok {
+		t.Fatal("client session is not *Session")
+	}
+	server, ok := serverSession.(*Session)
+	if !ok {
+		t.Fatal("server session is not *Session")
+	}
+	client.localEpoch.Store(0x1111)
+	server.localEpoch.Store(0x2222)
+	client.bridgeReady.Store(true)
+	server.bridgeReady.Store(true)
+
+	client.announceEpoch()
+	var request []byte
+	select {
+	case request = <-client.sendQueue:
+	case <-time.After(time.Second):
+		t.Fatal("initial epoch request was not queued")
+	}
+	senderEpoch, receiverEpoch, payload := decodeBridgeFrameForTest(t, request)
+	if senderEpoch != 0x1111 || receiverEpoch != 0 || len(payload) != 0 {
+		t.Fatalf("request = sender 0x%08x receiver 0x%08x payload %q", senderEpoch, receiverEpoch, payload)
 	}
 
-	// A further frame from the latched peer keeps flowing.
-	more := makeBridgeFrameForEpoch(t, 0x1111, 0, []byte("MORE"))
-	js.deliverBridgeMessage(makeBridgeMessageFrom("server", map[string]any{rawFieldKey: more}), true)
-	if len(received) != 2 || string(received[1]) != "MORE" {
-		t.Fatalf("received = %q, want server welcome + MORE", received)
+	server.deliverBridgeMessage(
+		makeBridgeMessageFrom("client", map[string]any{rawFieldKey: encodeForTest(t, request)}), true,
+	)
+	var acknowledgement bridgeOutbound
+	select {
+	case acknowledgement = <-server.peerSendQueue:
+	case <-time.After(time.Second):
+		t.Fatal("targeted epoch acknowledgement was not queued")
+	}
+	if acknowledgement.to != "client" {
+		t.Fatalf("acknowledgement target = %q, want client", acknowledgement.to)
+	}
+	senderEpoch, receiverEpoch, payload = decodeBridgeFrameForTest(t, acknowledgement.data)
+	if senderEpoch != 0x2222 || receiverEpoch != 0x1111 || len(payload) != 0 {
+		t.Fatalf("acknowledgement = sender 0x%08x receiver 0x%08x payload %q",
+			senderEpoch, receiverEpoch, payload)
+	}
+
+	client.deliverBridgeMessage(
+		makeBridgeMessageFrom("server", map[string]any{rawFieldKey: encodeForTest(t, acknowledgement.data)}), true,
+	)
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.WaitForPeer(waitCtx); err != nil {
+		t.Fatalf("WaitForPeer: %v", err)
+	}
+	if got := client.peerEpoch.Load(); got != 0x2222 {
+		t.Fatalf("client peerEpoch = 0x%08x, want server epoch", got)
+	}
+	if clientData || serverData {
+		t.Fatalf("empty epoch exchange reached data callbacks: client=%v server=%v", clientData, serverData)
+	}
+}
+
+//nolint:cyclop // timing regression test asserts pre-ready silence, retry framing, and completion
+func TestWaitForPeerAnnouncesAfterBridgeBecomesReady(t *testing.T) {
+	sess, err := New(context.Background(), engine.Config{
+		URL:                 testHost,
+		Extra:               map[string]string{credentialKeyRoom: testRoom},
+		RequireTargetedPeer: true,
+		OnData:              func([]byte) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	js, ok := sess.(*Session)
+	if !ok {
+		t.Fatal("sess is not *Session")
+	}
+	js.localEpoch.Store(0x1111)
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	waitResult := make(chan error, 1)
+	go func() {
+		waitResult <- js.WaitForPeer(waitCtx)
+	}()
+
+	select {
+	case <-js.sendQueue:
+		t.Fatal("WaitForPeer announced before the bridge became ready")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	js.bridgeReady.Store(true)
+	var request []byte
+	select {
+	case request = <-js.sendQueue:
+	case <-time.After(time.Second):
+		t.Fatal("WaitForPeer did not retry the epoch request after bridge readiness")
+	}
+	senderEpoch, receiverEpoch, payload := decodeBridgeFrameForTest(t, request)
+	if senderEpoch != 0x1111 || receiverEpoch != 0 || len(payload) != 0 {
+		t.Fatalf("request = sender 0x%08x receiver 0x%08x payload %q", senderEpoch, receiverEpoch, payload)
+	}
+
+	acknowledgement := makeBridgeFrameForEpoch(t, 0x2222, 0x1111, nil)
+	js.deliverBridgeMessage(
+		makeBridgeMessageFrom("server", map[string]any{rawFieldKey: acknowledgement}), true,
+	)
+	select {
+	case err := <-waitResult:
+		if err != nil {
+			t.Fatalf("WaitForPeer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForPeer did not observe the targeted acknowledgement")
 	}
 }
 

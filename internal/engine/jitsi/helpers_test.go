@@ -1,6 +1,7 @@
 package jitsi
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"testing"
@@ -42,4 +43,19 @@ func makeBridgeFrameForEpoch(t *testing.T, senderEpoch, receiverEpoch uint32, pa
 	framed = append(framed, hdr[:]...)
 	framed = append(framed, payload...)
 	return base64.StdEncoding.EncodeToString(framed)
+}
+
+func decodeBridgeFrameForTest(t *testing.T, frame []byte) (uint32, uint32, []byte) {
+	t.Helper()
+	const epochHeaderLen = 8
+	if len(frame) < len(bridgeMagic)+epochHeaderLen {
+		t.Fatalf("bridge frame length = %d, want at least %d", len(frame), len(bridgeMagic)+epochHeaderLen)
+	}
+	if !bytes.Equal(frame[:len(bridgeMagic)], bridgeMagic[:]) {
+		t.Fatalf("bridge frame magic = %x, want %x", frame[:len(bridgeMagic)], bridgeMagic)
+	}
+	off := len(bridgeMagic)
+	return binary.BigEndian.Uint32(frame[off : off+4]),
+		binary.BigEndian.Uint32(frame[off+4 : off+epochHeaderLen]),
+		frame[off+epochHeaderLen:]
 }

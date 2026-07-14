@@ -12,7 +12,7 @@ on:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,7 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,7 +44,7 @@ jobs:
 
   race:
     name: Test (-race)
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +61,8 @@ jobs:
 
   real-e2e:
     name: Real E2E (Providers x Transports)
-    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -88,7 +89,7 @@ jobs:
     # Long-form stress over real carriers: only on schedule or manual
     # dispatch. Push and PR runs stay fast.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -118,7 +119,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,7 +137,7 @@ jobs:
 
   build-cli:
     name: Build CLI (Binaries)
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -154,14 +155,14 @@ jobs:
         run: mage cross
 
       - name: Upload CLI Artifacts
-        uses: actions/upload-artifact@v4
+        uses: namespace-actions/upload-artifact@f6ccaacc655aec41b93af180d1d7eef21af862d2 # v1
         with:
           name: olcrtc-cli-binaries
           path: build/
 
   build-android:
     name: Build Android (AAR)
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -190,7 +191,7 @@ jobs:
         run: mage mobile
 
       - name: Upload Android Artifact
-        uses: actions/upload-artifact@v4
+        uses: namespace-actions/upload-artifact@f6ccaacc655aec41b93af180d1d7eef21af862d2 # v1
         with:
           name: olcrtc-android
           path: build/olcrtc.aar
@@ -198,7 +199,7 @@ jobs:
   nightly-soak:
     name: Nightly Soak (All Carriers × Transports)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: nscloud-ubuntu-24.04-amd64-4x8
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
